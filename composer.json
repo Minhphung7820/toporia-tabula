@@ -38,7 +38,10 @@
         "toporia": {
             "providers": [
                 "Toporia\\Tabula\\TabulaServiceProvider"
-            ]
+            ],
+            "config": {
+                "tabula": "config/tabula.php"
+            }
         }
     },
     "minimum-stability": "stable"
