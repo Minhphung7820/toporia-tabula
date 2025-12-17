@@ -274,6 +274,56 @@ User::exportTo('/path/to/users.xlsx', ['id', 'name', 'email']);
 User::downloadAs('users.xlsx', ['id', 'name', 'email']);
 ```
 
+### Quick Exports (Fluent API)
+
+```php
+use Toporia\Tabula\Exports\FromQueryExport;
+use Toporia\Tabula\Exports\FromCollectionExport;
+
+// Export from query with O(1) memory
+$export = FromQueryExport::make(User::query()->where('active', true))
+    ->columns(['id', 'name', 'email', 'created_at'])
+    ->withHeaders(['ID', 'Name', 'Email', 'Created At'])
+    ->format('created_at', fn($v) => $v?->format('Y-m-d'));
+
+Tabula::export($export, '/path/to/users.xlsx');
+
+// Export from collection/array
+$export = FromCollectionExport::make($users)
+    ->columns(['name', 'email'])
+    ->withHeaders(['Name', 'Email']);
+
+Tabula::export($export, '/path/to/users.xlsx');
+```
+
+### Quick Model Imports (Fluent API)
+
+```php
+use Toporia\Tabula\Imports\ToModelImport;
+
+// Import directly to model with upsert
+$import = ToModelImport::make(User::class)
+    ->map(fn($row) => [
+        'name' => $row['name'],
+        'email' => $row['email'],
+    ])
+    ->upsertBy(['email'])  // Update if email exists
+    ->chunk(1000)
+    ->batch(500);
+
+Tabula::import($import, '/path/to/users.xlsx');
+```
+
+### Console Commands
+
+```bash
+# Import from command line
+php console tabula:import "App\Imports\UsersImport" /path/to/file.xlsx --chunk=5000
+
+# Export from command line
+php console tabula:export "App\Exports\UsersExport" /path/to/output.xlsx
+```
+
 ## Performance
 
 Tested with files containing millions of rows:

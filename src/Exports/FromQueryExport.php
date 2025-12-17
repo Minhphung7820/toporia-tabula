@@ -99,7 +99,7 @@ final class FromQueryExport implements
      * @param array<string> $headers Header labels
      * @return self
      */
-    public function headers(array $headers): self
+    public function withHeaders(array $headers): self
     {
         $this->headerRow = $headers;
         return $this;

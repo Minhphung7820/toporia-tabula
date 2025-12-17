@@ -119,7 +119,7 @@ final class FromCollectionExport implements
      * @param array<string> $headers
      * @return self
      */
-    public function headers(array $headers): self
+    public function withHeaders(array $headers): self
     {
         $this->headerRow = $headers;
         return $this;

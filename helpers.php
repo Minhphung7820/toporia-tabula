@@ -122,7 +122,7 @@ if (!function_exists('tabula_from_query')) {
      * @example
      * tabula_from_query(User::query()->where('active', true))
      *     ->columns(['name', 'email'])
-     *     ->headers(['Full Name', 'Email Address']);
+     *     ->withHeaders(['Full Name', 'Email Address']);
      */
     function tabula_from_query(mixed $query): FromQueryExport
     {
@@ -140,7 +140,7 @@ if (!function_exists('tabula_from_collection')) {
      * @example
      * tabula_from_collection($users)
      *     ->columns(['name', 'email'])
-     *     ->headers(['Name', 'Email']);
+     *     ->withHeaders(['Name', 'Email']);
      */
     function tabula_from_collection(iterable $collection): FromCollectionExport
     {
