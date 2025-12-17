@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 use Toporia\Tabula\Contracts\ExportableInterface;
 use Toporia\Tabula\Contracts\ImportableInterface;
+use Toporia\Tabula\Exports\FromCollectionExport;
+use Toporia\Tabula\Exports\FromQueryExport;
+use Toporia\Tabula\Imports\ToModelImport;
 use Toporia\Tabula\Support\ExportResult;
 use Toporia\Tabula\Support\ImportResult;
 use Toporia\Tabula\Tabula;
@@ -106,5 +109,59 @@ if (!function_exists('tabula_queue_export')) {
         array $options = []
     ): void {
         Tabula::queueExport($export, $filePath, $options);
+    }
+}
+
+if (!function_exists('tabula_from_query')) {
+    /**
+     * Create an export from a query builder.
+     *
+     * @param mixed $query Query builder instance
+     * @return FromQueryExport
+     *
+     * @example
+     * tabula_from_query(User::query()->where('active', true))
+     *     ->columns(['name', 'email'])
+     *     ->headers(['Full Name', 'Email Address']);
+     */
+    function tabula_from_query(mixed $query): FromQueryExport
+    {
+        return FromQueryExport::make($query);
+    }
+}
+
+if (!function_exists('tabula_from_collection')) {
+    /**
+     * Create an export from a collection or array.
+     *
+     * @param iterable<mixed> $collection
+     * @return FromCollectionExport
+     *
+     * @example
+     * tabula_from_collection($users)
+     *     ->columns(['name', 'email'])
+     *     ->headers(['Name', 'Email']);
+     */
+    function tabula_from_collection(iterable $collection): FromCollectionExport
+    {
+        return FromCollectionExport::make($collection);
+    }
+}
+
+if (!function_exists('tabula_to_model')) {
+    /**
+     * Create an import to a model.
+     *
+     * @param string $modelClass Model class name
+     * @return ToModelImport
+     *
+     * @example
+     * tabula_to_model(User::class)
+     *     ->map(fn($row) => ['name' => $row['name'], 'email' => $row['email']])
+     *     ->upsertBy(['email']);
+     */
+    function tabula_to_model(string $modelClass): ToModelImport
+    {
+        return ToModelImport::make($modelClass);
     }
 }

@@ -6,6 +6,8 @@ namespace Toporia\Tabula;
 
 use Toporia\Framework\Container\Contracts\ContainerInterface;
 use Toporia\Framework\Foundation\ServiceProvider;
+use Toporia\Tabula\Console\Commands\ExportCommand;
+use Toporia\Tabula\Console\Commands\ImportCommand;
 use Toporia\Tabula\Exports\Exporter;
 use Toporia\Tabula\Imports\Importer;
 
@@ -21,6 +23,16 @@ final class TabulaServiceProvider extends ServiceProvider
      * Indicates if loading of the provider is deferred.
      */
     protected bool $defer = true;
+
+    /**
+     * Console commands provided by the package.
+     *
+     * @var array<class-string>
+     */
+    protected array $commands = [
+        ImportCommand::class,
+        ExportCommand::class,
+    ];
 
     /**
      * Get the services provided by the provider.
@@ -74,5 +86,28 @@ final class TabulaServiceProvider extends ServiceProvider
         $this->publishes([
             __DIR__ . '/../config/tabula.php' => 'config/tabula.php',
         ], 'tabula-config');
+
+        // Register console commands
+        if ($this->isRunningInConsole()) {
+            $this->registerCommands($container);
+        }
+    }
+
+    /**
+     * Register console commands.
+     */
+    private function registerCommands(ContainerInterface $container): void
+    {
+        foreach ($this->commands as $command) {
+            $container->singleton($command);
+        }
+    }
+
+    /**
+     * Check if running in console.
+     */
+    private function isRunningInConsole(): bool
+    {
+        return PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg';
     }
 }
