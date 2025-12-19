@@ -121,13 +121,21 @@ final class FromQueryExport implements
     /**
      * Set sheet title.
      *
-     * @param string $title
+     * @param string $titleStr
      * @return self
      */
-    public function title(string $title): self
+    public function withTitle(string $titleStr): self
     {
-        $this->titleValue = substr($title, 0, 31);
+        $this->titleValue = substr($titleStr, 0, 31);
         return $this;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function title(): string
+    {
+        return $this->titleValue;
     }
 
     /**
