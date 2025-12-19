@@ -9,6 +9,7 @@ use Toporia\Tabula\Contracts\ToModelInterface;
 use Toporia\Tabula\Contracts\WithBatchInsertsInterface;
 use Toporia\Tabula\Contracts\WithChunkReadingInterface;
 use Toporia\Tabula\Contracts\WithHeadingRowInterface;
+use Toporia\Tabula\Contracts\WithParallelInterface;
 
 /**
  * Class ToModelImport
@@ -39,13 +40,19 @@ use Toporia\Tabula\Contracts\WithHeadingRowInterface;
  *         'price' => $row['price'],
  *     ])
  *     ->upsertBy(['sku']);
+ *
+ * // With parallel processing (4 workers)
+ * $import = ToModelImport::make(Post::class)
+ *     ->map(fn($row) => [...])
+ *     ->parallel(4);
  */
 final class ToModelImport implements
     ImportableInterface,
     ToModelInterface,
     WithChunkReadingInterface,
     WithBatchInsertsInterface,
-    WithHeadingRowInterface
+    WithHeadingRowInterface,
+    WithParallelInterface
 {
     private string $modelClass;
 
@@ -67,6 +74,9 @@ final class ToModelImport implements
     private int $chunkSizeValue = 1000;
     private int $batchSizeValue = 500;
     private int $headingRowValue = 1;
+    private int $workersValue = 1;
+    private string $driverValue = 'process';
+    private bool $disableFkChecks = false;
 
     /**
      * @var array<array<string, mixed>> Batch buffer for inserts
@@ -173,6 +183,102 @@ final class ToModelImport implements
     }
 
     /**
+     * Enable parallel processing with N workers.
+     *
+     * Uses pcntl_fork() for true parallelism.
+     * Each worker processes every Nth line with its own DB connection.
+     *
+     * @param int $workers Number of parallel workers (2-16 recommended)
+     * @param string $driver Concurrency driver (fork, process, sync)
+     * @return self
+     */
+    public function parallel(int $workers, string $driver = 'fork'): self
+    {
+        $this->workersValue = max(1, min(16, $workers));
+        $this->driverValue = $driver;
+        return $this;
+    }
+
+    /**
+     * Disable foreign key checks during import.
+     *
+     * Useful when importing data with foreign key references
+     * that may not exist yet (e.g., importing posts before users).
+     *
+     * @param bool $disable
+     * @return self
+     */
+    public function disableForeignKeyChecks(bool $disable = true): self
+    {
+        $this->disableFkChecks = $disable;
+        return $this;
+    }
+
+    /**
+     * Check if foreign key checks should be disabled.
+     *
+     * @return bool
+     */
+    public function shouldDisableForeignKeyChecks(): bool
+    {
+        return $this->disableFkChecks;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function workers(): int
+    {
+        return $this->workersValue;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function isParallel(): bool
+    {
+        return $this->workersValue > 1;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function getDriver(): string
+    {
+        return $this->driverValue;
+    }
+
+    /**
+     * Get the mapper callable for use in child processes.
+     *
+     * @return callable|null
+     */
+    public function getMapper(): ?callable
+    {
+        return $this->mapper;
+    }
+
+    /**
+     * Get unique columns for upsert.
+     *
+     * @return array<string>|null
+     */
+    public function getUniqueBy(): ?array
+    {
+        return $this->uniqueBy;
+    }
+
+    /**
+     * Get upsert columns.
+     *
+     * @return array<string>|null
+     */
+    public function getUpsertColumns(): ?array
+    {
+        return $this->upsertColumns;
+    }
+
+    /**
      * {@inheritdoc}
      *
      * Process a single row (fallback for non-bulk imports).
@@ -226,21 +332,47 @@ final class ToModelImport implements
         $model = $this->modelClass;
         $total = 0;
 
-        // Split into batches for database insert
-        $chunks = array_chunk($rows, $this->batchSizeValue);
+        // Disable foreign key checks if configured
+        $fkDisabled = false;
+        if ($this->disableFkChecks && function_exists('DB') && function_exists('config')) {
+            try {
+                $defaultConnection = config('database.default', 'mysql');
+                $conn = DB()->connection($defaultConnection);
+                $conn->statement('SET FOREIGN_KEY_CHECKS=0');
+                $fkDisabled = true;
+            } catch (\Throwable $e) {
+                // Silently continue if FK disable fails
+            }
+        }
 
-        foreach ($chunks as $chunk) {
-            if ($this->uniqueBy !== null && method_exists($model, 'upsert')) {
-                $model::upsert($chunk, $this->uniqueBy, $this->upsertColumns);
-            } elseif (method_exists($model, 'insert')) {
-                $model::insert($chunk);
-            } else {
-                // Fallback: individual creates (slow)
-                foreach ($chunk as $data) {
-                    $model::create($data);
+        try {
+            // Split into batches for database insert
+            $chunks = array_chunk($rows, $this->batchSizeValue);
+
+            foreach ($chunks as $chunk) {
+                if ($this->uniqueBy !== null && method_exists($model, 'upsert')) {
+                    $model::upsert($chunk, $this->uniqueBy, $this->upsertColumns);
+                } elseif (method_exists($model, 'insert')) {
+                    $model::insert($chunk);
+                } else {
+                    // Fallback: individual creates (slow)
+                    foreach ($chunk as $data) {
+                        $model::create($data);
+                    }
+                }
+                $total += count($chunk);
+            }
+        } finally {
+            // Re-enable foreign key checks
+            if ($fkDisabled) {
+                try {
+                    $defaultConnection = config('database.default', 'mysql');
+                    $conn = DB()->connection($defaultConnection);
+                    $conn->statement('SET FOREIGN_KEY_CHECKS=1');
+                } catch (\Throwable $e) {
+                    // Silently continue
                 }
             }
-            $total += count($chunk);
         }
 
         return $total;
@@ -308,27 +440,53 @@ final class ToModelImport implements
 
         $model = $this->modelClass;
 
-        if ($this->uniqueBy !== null) {
-            // Upsert mode
-            if (method_exists($model, 'upsert')) {
-                $model::upsert($this->batchBuffer, $this->uniqueBy, $this->upsertColumns);
+        // Disable foreign key checks if configured
+        $fkDisabled = false;
+        if ($this->disableFkChecks && function_exists('DB') && function_exists('config')) {
+            try {
+                $defaultConnection = config('database.default', 'mysql');
+                $conn = DB()->connection($defaultConnection);
+                $conn->statement('SET FOREIGN_KEY_CHECKS=0');
+                $fkDisabled = true;
+            } catch (\Throwable $e) {
+                // Silently continue
+            }
+        }
+
+        try {
+            if ($this->uniqueBy !== null) {
+                // Upsert mode
+                if (method_exists($model, 'upsert')) {
+                    $model::upsert($this->batchBuffer, $this->uniqueBy, $this->upsertColumns);
+                } else {
+                    // Fallback: individual upserts
+                    foreach ($this->batchBuffer as $data) {
+                        $model::updateOrCreate(
+                            array_intersect_key($data, array_flip($this->uniqueBy)),
+                            $data
+                        );
+                    }
+                }
             } else {
-                // Fallback: individual upserts
-                foreach ($this->batchBuffer as $data) {
-                    $model::updateOrCreate(
-                        array_intersect_key($data, array_flip($this->uniqueBy)),
-                        $data
-                    );
+                // Insert mode
+                if (method_exists($model, 'insert')) {
+                    $model::insert($this->batchBuffer);
+                } else {
+                    // Fallback: individual creates
+                    foreach ($this->batchBuffer as $data) {
+                        $model::create($data);
+                    }
                 }
             }
-        } else {
-            // Insert mode
-            if (method_exists($model, 'insert')) {
-                $model::insert($this->batchBuffer);
-            } else {
-                // Fallback: individual creates
-                foreach ($this->batchBuffer as $data) {
-                    $model::create($data);
+        } finally {
+            // Re-enable foreign key checks
+            if ($fkDisabled) {
+                try {
+                    $defaultConnection = config('database.default', 'mysql');
+                    $conn = DB()->connection($defaultConnection);
+                    $conn->statement('SET FOREIGN_KEY_CHECKS=1');
+                } catch (\Throwable $e) {
+                    // Silently continue
                 }
             }
         }
