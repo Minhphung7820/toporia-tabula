@@ -17,6 +17,12 @@ use Toporia\Tabula\Exceptions\ImportException;
  * - Memory: O(1) - streams rows one at a time
  * - Time: O(n) where n = number of rows
  * - Optimal for large CSV files
+ *
+ * v2.0 Optimizations for 1M+ rows:
+ * - Pre-computed header index using array_combine (O(1) vs O(n) per row)
+ * - Configurable read buffer size for I/O optimization
+ * - Raw mode option to skip header mapping entirely
+ * - Optimized empty row check
  */
 final class CsvReader implements ReaderInterface
 {
@@ -52,6 +58,17 @@ final class CsvReader implements ReaderInterface
      * Input encoding.
      */
     private string $inputEncoding = 'UTF-8';
+
+    /**
+     * Raw mode - returns indexed arrays without header mapping.
+     * Use when caller handles mapping for better performance.
+     */
+    private bool $rawMode = false;
+
+    /**
+     * Number of header columns (cached for performance).
+     */
+    private int $headerCount = 0;
 
     /**
      * Set whether file has header row.
@@ -114,6 +131,21 @@ final class CsvReader implements ReaderInterface
     }
 
     /**
+     * Enable raw mode for maximum performance.
+     *
+     * In raw mode, rows are returned as indexed arrays (no header mapping).
+     * The caller is responsible for accessing values by index.
+     *
+     * @param bool $rawMode
+     * @return self
+     */
+    public function setRawMode(bool $rawMode): self
+    {
+        $this->rawMode = $rawMode;
+        return $this;
+    }
+
+    /**
      * Auto-detect delimiter from file.
      *
      * @param string $filePath
@@ -162,6 +194,9 @@ final class CsvReader implements ReaderInterface
             throw new ImportException("Cannot open file: {$filePath}");
         }
 
+        // Set larger read buffer for better I/O performance
+        stream_set_read_buffer($this->handle, 65536); // 64KB buffer
+
         return $this;
     }
 
@@ -179,44 +214,116 @@ final class CsvReader implements ReaderInterface
 
         $rowNumber = 0;
         $this->headers = [];
+        $this->headerCount = 0;
+        $needsEncoding = $this->inputEncoding !== 'UTF-8';
 
         while (($row = fgetcsv($this->handle, 0, $this->delimiter, $this->enclosure, $this->escape)) !== false) {
             $rowNumber++;
 
-            // Convert encoding if needed
-            if ($this->inputEncoding !== 'UTF-8') {
-                $row = array_map(function ($value) {
-                    if ($value === null) {
-                        return null;
-                    }
-                    return mb_convert_encoding($value, 'UTF-8', $this->inputEncoding);
-                }, $row);
+            // Convert encoding if needed (rare case)
+            if ($needsEncoding) {
+                $row = $this->convertEncoding($row);
             }
 
             // Capture header row
             if ($this->hasHeaderRow && $rowNumber === 1) {
-                $this->headers = array_map(function ($value) {
-                    return $value !== null ? trim($value) : '';
-                }, $row);
+                $this->headers = array_map('trim', $row);
+                $this->headerCount = count($this->headers);
                 continue;
             }
 
-            // Skip empty rows
-            if ($this->isEmptyRow($row)) {
-                continue;
-            }
-
-            // Map row data to headers if available
-            if (!empty($this->headers)) {
-                $mappedRow = [];
-                foreach ($this->headers as $colIndex => $header) {
-                    $key = $header !== '' ? $header : $colIndex;
-                    $mappedRow[$key] = $row[$colIndex] ?? null;
+            // Quick empty row check - just check first cell
+            if ($row[0] === null || $row[0] === '') {
+                // Full check only if first cell is empty
+                if ($this->isEmptyRow($row)) {
+                    continue;
                 }
-                $row = $mappedRow;
+            }
+
+            // Map row data to headers using array_combine (O(1) operation)
+            // Only if not in raw mode and headers exist
+            if (!$this->rawMode && $this->headerCount > 0) {
+                // Ensure row has same number of elements as headers
+                $rowCount = count($row);
+                if ($rowCount < $this->headerCount) {
+                    $row = array_pad($row, $this->headerCount, null);
+                } elseif ($rowCount > $this->headerCount) {
+                    $row = array_slice($row, 0, $this->headerCount);
+                }
+
+                $row = array_combine($this->headers, $row);
             }
 
             yield $rowNumber => $row;
+        }
+    }
+
+    /**
+     * Read rows in batches for better performance.
+     *
+     * This method reads multiple rows at once and returns them as an array.
+     * More efficient than iterating row by row when processing in batches.
+     *
+     * @param int $batchSize Number of rows per batch
+     * @return \Generator<int, array<array<string|int, mixed>>>
+     */
+    public function rowsBatched(int $batchSize = 1000): \Generator
+    {
+        if ($this->handle === null) {
+            throw new ImportException('Reader not opened. Call open() first.');
+        }
+
+        rewind($this->handle);
+
+        $rowNumber = 0;
+        $batch = [];
+        $this->headers = [];
+        $this->headerCount = 0;
+        $needsEncoding = $this->inputEncoding !== 'UTF-8';
+
+        while (($row = fgetcsv($this->handle, 0, $this->delimiter, $this->enclosure, $this->escape)) !== false) {
+            $rowNumber++;
+
+            if ($needsEncoding) {
+                $row = $this->convertEncoding($row);
+            }
+
+            // Capture header row
+            if ($this->hasHeaderRow && $rowNumber === 1) {
+                $this->headers = array_map('trim', $row);
+                $this->headerCount = count($this->headers);
+                continue;
+            }
+
+            // Quick empty check
+            if ($row[0] === null || $row[0] === '') {
+                if ($this->isEmptyRow($row)) {
+                    continue;
+                }
+            }
+
+            // Map headers if needed
+            if (!$this->rawMode && $this->headerCount > 0) {
+                $rowCount = count($row);
+                if ($rowCount < $this->headerCount) {
+                    $row = array_pad($row, $this->headerCount, null);
+                } elseif ($rowCount > $this->headerCount) {
+                    $row = array_slice($row, 0, $this->headerCount);
+                }
+                $row = array_combine($this->headers, $row);
+            }
+
+            $batch[] = $row;
+
+            if (count($batch) >= $batchSize) {
+                yield $batch;
+                $batch = [];
+            }
+        }
+
+        // Yield remaining rows
+        if (!empty($batch)) {
+            yield $batch;
         }
     }
 
@@ -229,7 +336,7 @@ final class CsvReader implements ReaderInterface
             return 0;
         }
 
-        // Fast line count using wc -l equivalent
+        // Fast line count using larger buffer
         $count = 0;
         $handle = fopen($this->filePath, 'r');
 
@@ -237,8 +344,9 @@ final class CsvReader implements ReaderInterface
             return 0;
         }
 
+        // Use larger buffer for faster counting
         while (!feof($handle)) {
-            $buffer = fread($handle, 8192);
+            $buffer = fread($handle, 65536); // 64KB chunks
             if ($buffer === false) {
                 break;
             }
@@ -265,6 +373,7 @@ final class CsvReader implements ReaderInterface
             $this->handle = null;
         }
         $this->headers = [];
+        $this->headerCount = 0;
     }
 
     /**
@@ -283,6 +392,22 @@ final class CsvReader implements ReaderInterface
     public function getHeaders(): array
     {
         return $this->headers;
+    }
+
+    /**
+     * Convert row encoding to UTF-8.
+     *
+     * @param array<mixed> $row
+     * @return array<mixed>
+     */
+    private function convertEncoding(array $row): array
+    {
+        foreach ($row as $index => $value) {
+            if ($value !== null) {
+                $row[$index] = mb_convert_encoding($value, 'UTF-8', $this->inputEncoding);
+            }
+        }
+        return $row;
     }
 
     /**

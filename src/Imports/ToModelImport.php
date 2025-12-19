@@ -9,13 +9,17 @@ use Toporia\Tabula\Contracts\ToModelInterface;
 use Toporia\Tabula\Contracts\WithBatchInsertsInterface;
 use Toporia\Tabula\Contracts\WithChunkReadingInterface;
 use Toporia\Tabula\Contracts\WithHeadingRowInterface;
-use Toporia\Tabula\Contracts\WithUpsertInterface;
 
 /**
  * Class ToModelImport
  *
  * Import class for importing directly to a model.
  * Supports batch inserts, upserts, and automatic chunking.
+ *
+ * Performance optimizations (v2.0):
+ * - mapRow() method for batch mapping via array_map() in Importer
+ * - bulkInsert() receives pre-mapped data (no double mapping)
+ * - Direct Model::insert() without intermediate buffering
  *
  * @example
  * // Simple usage
@@ -86,7 +90,10 @@ final class ToModelImport implements
     }
 
     /**
-     * Set row mapper.
+     * Set row mapper (fluent API).
+     *
+     * This method sets the mapper callable and returns self for chaining.
+     * The actual mapping is done via WithMappingInterface::map().
      *
      * @param callable(array<string|int, mixed>): ?array<string, mixed> $mapper
      * @return self
@@ -95,6 +102,24 @@ final class ToModelImport implements
     {
         $this->mapper = $mapper;
         return $this;
+    }
+
+    /**
+     * Map a single row using the configured mapper.
+     *
+     * Called by Importer::processChunkedOptimized() via array_map().
+     * This enables batch mapping which is faster than mapping in bulkInsert().
+     *
+     * @param array<string|int, mixed> $row Raw CSV row
+     * @return array<string, mixed> Mapped row for database insert
+     */
+    public function mapRow(array $row): array
+    {
+        if ($this->mapper !== null) {
+            $result = ($this->mapper)($row);
+            return $result ?? [];
+        }
+        return $row;
     }
 
     /**
@@ -112,7 +137,7 @@ final class ToModelImport implements
     }
 
     /**
-     * Set chunk size.
+     * Set chunk size (rows read from file per batch).
      *
      * @param int $size
      * @return self
@@ -149,6 +174,8 @@ final class ToModelImport implements
 
     /**
      * {@inheritdoc}
+     *
+     * Process a single row (fallback for non-bulk imports).
      */
     public function row(array $row, int $rowNumber): void
     {
@@ -167,6 +194,59 @@ final class ToModelImport implements
     }
 
     /**
+     * Bulk insert multiple rows at once.
+     *
+     * IMPORTANT: When called from Importer::processChunkedOptimized(),
+     * rows are ALREADY MAPPED via WithMappingInterface::map().
+     * We skip re-mapping to avoid double processing.
+     *
+     * @param array<array<string|int, mixed>> $rows Array of rows (pre-mapped from Importer)
+     * @return int Number of rows inserted
+     */
+    public function bulkInsert(array $rows): int
+    {
+        if (empty($rows)) {
+            return 0;
+        }
+
+        // Rows are already mapped by Importer::processChunkedOptimized()
+        // via array_map([$import, 'mapRow'], $batch)
+        // So we directly insert without re-mapping
+        return $this->insertRows($rows);
+    }
+
+    /**
+     * Insert rows into database in batches.
+     *
+     * @param array<array<string, mixed>> $rows Mapped rows
+     * @return int Number of rows inserted
+     */
+    private function insertRows(array $rows): int
+    {
+        $model = $this->modelClass;
+        $total = 0;
+
+        // Split into batches for database insert
+        $chunks = array_chunk($rows, $this->batchSizeValue);
+
+        foreach ($chunks as $chunk) {
+            if ($this->uniqueBy !== null && method_exists($model, 'upsert')) {
+                $model::upsert($chunk, $this->uniqueBy, $this->upsertColumns);
+            } elseif (method_exists($model, 'insert')) {
+                $model::insert($chunk);
+            } else {
+                // Fallback: individual creates (slow)
+                foreach ($chunk as $data) {
+                    $model::create($data);
+                }
+            }
+            $total += count($chunk);
+        }
+
+        return $total;
+    }
+
+    /**
      * {@inheritdoc}
      */
     public function model(): string
@@ -175,7 +255,12 @@ final class ToModelImport implements
     }
 
     /**
-     * {@inheritdoc}
+     * Get model data from row (applies mapping if needed).
+     *
+     * Used by row() method for non-bulk processing.
+     *
+     * @param array<string|int, mixed> $row
+     * @return array<string, mixed>|null
      */
     public function modelData(array $row): ?array
     {
@@ -183,7 +268,6 @@ final class ToModelImport implements
             return ($this->mapper)($row);
         }
 
-        // Default: use row as-is
         return $row;
     }
 

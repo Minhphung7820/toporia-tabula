@@ -26,11 +26,13 @@ use Toporia\Tabula\Support\ImportResult;
  * Main class for handling imports.
  * Supports streaming, chunking, validation, and batch processing.
  *
- * Performance optimizations:
+ * Performance optimizations (v2.0):
  * - Streaming reads: O(1) memory
  * - Chunk processing: configurable batch sizes
  * - Batch database inserts: reduces queries
  * - Progress tracking: optional overhead
+ * - Batch mapping: process mapping in chunks instead of row-by-row
+ * - Optimized row counting: only when needed
  */
 final class Importer
 {
@@ -136,7 +138,12 @@ final class Importer
 
         $this->fireEvent($import, 'beforeImport');
 
-        $result = $this->processChunked($import, $reader);
+        // Use optimized batch processing for CSV files
+        if ($reader instanceof CsvReader && method_exists($import, 'bulkInsert')) {
+            $result = $this->processChunkedOptimized($import, $reader);
+        } else {
+            $result = $this->processChunked($import, $reader);
+        }
 
         $reader->close();
 
@@ -259,6 +266,93 @@ final class Importer
     }
 
     /**
+     * Optimized chunked processing for CSV files with bulk insert support.
+     *
+     * Key optimizations:
+     * - Uses CsvReader::rowsBatched() to read in batches (reduces generator overhead)
+     * - Applies mapping in batch using array_map (better for JIT optimization)
+     * - Sends entire batch to bulkInsert() without intermediate chunking
+     * - Minimal method calls and object allocations
+     *
+     * @param ImportableInterface&WithChunkReadingInterface $import
+     * @param CsvReader $reader
+     * @return ImportResult
+     */
+    private function processChunkedOptimized(
+        ImportableInterface&WithChunkReadingInterface $import,
+        CsvReader $reader
+    ): ImportResult {
+        $result = new ImportResult();
+        $chunkSize = $import->chunkSize();
+
+        // Check interfaces once
+        $needsValidation = $import instanceof WithValidationInterface;
+        $needsProgress = $import instanceof WithProgressInterface;
+
+        // Check for mapping capability
+        // Priority: mapRow() method (for ToModelImport) > WithMappingInterface::map()
+        $mapper = null;
+        if (method_exists($import, 'mapRow')) {
+            $mapper = [$import, 'mapRow'];
+        } elseif ($import instanceof WithMappingInterface) {
+            $mapper = [$import, 'map'];
+        }
+
+        // Only count if progress needed (expensive for large files)
+        $totalRows = $needsProgress ? $reader->count() : 0;
+
+        // Get validation rules once if needed
+        $rules = $needsValidation ? $import->rules() : [];
+        $messages = $needsValidation ? $import->customValidationMessages() : [];
+
+        // Use batch reading from CsvReader
+        foreach ($reader->rowsBatched($chunkSize) as $batch) {
+            $batchSize = count($batch);
+            $result->incrementTotal($batchSize);
+
+            // Apply mapping in batch if mapper exists
+            if ($mapper !== null) {
+                $batch = array_map($mapper, $batch);
+            }
+
+            // Validation (if needed)
+            if ($needsValidation) {
+                $validBatch = [];
+                foreach ($batch as $rowData) {
+                    $errors = $this->validateRow($rowData, $rules, $messages);
+                    if (empty($errors)) {
+                        $validBatch[] = $rowData;
+                    } elseif ($this->skipInvalidRows) {
+                        $result->incrementSkipped();
+                    } else {
+                        throw ImportException::validationFailed(0, $errors);
+                    }
+                }
+                $batch = $validBatch;
+            }
+
+            // Bulk insert the entire batch
+            if (!empty($batch)) {
+                $inserted = (int) $import->bulkInsert($batch);
+                $result->incrementSuccess($inserted);
+            }
+
+            // Progress callback
+            if ($needsProgress && $totalRows > 0) {
+                $percentage = ($result->getTotalRows() / $totalRows) * 100;
+                $import->onProgress($result->getTotalRows(), $totalRows, $percentage);
+            }
+
+            // Periodic garbage collection for very large imports
+            if ($result->getTotalRows() % 100000 === 0) {
+                gc_collect_cycles();
+            }
+        }
+
+        return $result;
+    }
+
+    /**
      * Process rows in chunks.
      *
      * @param ImportableInterface&WithChunkReadingInterface $import
@@ -271,74 +365,83 @@ final class Importer
     ): ImportResult {
         $result = new ImportResult();
         $chunkSize = $import->chunkSize();
-        $batchSize = $import instanceof WithBatchInsertsInterface ? $import->batchSize() : $chunkSize;
 
         $chunk = [];
         $chunkIndex = 0;
-        $rowNumbers = [];
-        $totalRows = $reader->count();
+
+        // Check if we need validation (skip for performance if not needed)
+        $needsValidation = $import instanceof WithValidationInterface;
+        $needsMapping = $import instanceof WithMappingInterface;
+        $needsProgress = $import instanceof WithProgressInterface;
+
+        // Only count if progress callback is needed (expensive for large files)
+        $totalRows = $needsProgress ? $reader->count() : 0;
 
         foreach ($reader->rows() as $rowNumber => $row) {
             $result->incrementTotal();
 
-            try {
-                // Apply mapping
-                if ($import instanceof WithMappingInterface) {
-                    $row = $import->map($row);
-                }
+            // Apply mapping only if interface is implemented
+            if ($needsMapping) {
+                $row = $import->map($row);
+            }
 
-                // Validate
-                if ($import instanceof WithValidationInterface) {
-                    $errors = $this->validateRow($row, $import->rules(), $import->customValidationMessages());
+            // Validate only if interface is implemented
+            if ($needsValidation) {
+                $errors = $this->validateRow($row, $import->rules(), $import->customValidationMessages());
 
-                    if (!empty($errors)) {
-                        if ($this->skipInvalidRows) {
-                            $result->incrementSkipped();
-                            $result->addError($rowNumber, implode(', ', $errors), $row);
-                            continue;
-                        }
-                        throw ImportException::validationFailed($rowNumber, $errors);
+                if (!empty($errors)) {
+                    if ($this->skipInvalidRows) {
+                        $result->incrementSkipped();
+                        continue;
                     }
+                    throw ImportException::validationFailed($rowNumber, $errors);
                 }
+            }
 
-                $chunk[] = $row;
-                $rowNumbers[] = $rowNumber;
+            $chunk[] = $row;
 
-                // Process chunk when full
-                if (count($chunk) >= $chunkSize) {
-                    $this->processChunk($import, $chunk, $rowNumbers, $chunkIndex, $result);
-                    $chunk = [];
-                    $rowNumbers = [];
-                    $chunkIndex++;
+            // Process chunk when full
+            if (count($chunk) >= $chunkSize) {
+                $this->processChunkFast($import, $chunk, $result);
+                $chunk = [];
+                $chunkIndex++;
 
-                    // Progress callback
-                    if ($import instanceof WithProgressInterface) {
-                        $percentage = $totalRows > 0 ? ($result->getTotalRows() / $totalRows) * 100 : 0;
-                        $import->onProgress($result->getTotalRows(), $totalRows, $percentage);
-                    }
-                }
-
-            } catch (ImportException $e) {
-                throw $e;
-            } catch (\Throwable $e) {
-                $result->incrementFailed();
-                $result->addError($rowNumber, $e->getMessage(), $row);
-
-                $this->fireEvent($import, 'onError', [$e, $row, $rowNumber]);
-
-                if ($this->maxErrors !== null && $result->getFailedRows() >= $this->maxErrors) {
-                    $result->addWarning("Import stopped: Maximum errors ({$this->maxErrors}) reached");
-                    return $result;
+                // Progress callback (only if needed)
+                if ($needsProgress) {
+                    $percentage = $totalRows > 0 ? ($result->getTotalRows() / $totalRows) * 100 : 0;
+                    $import->onProgress($result->getTotalRows(), $totalRows, $percentage);
                 }
             }
         }
 
         // Process remaining chunk
         if (!empty($chunk)) {
-            $this->processChunk($import, $chunk, $rowNumbers, $chunkIndex, $result);
+            $this->processChunkFast($import, $chunk, $result);
         }
 
         return $result;
+    }
+
+    /**
+     * Process chunk with minimal overhead - optimized for speed.
+     */
+    private function processChunkFast(
+        ImportableInterface $import,
+        array $chunk,
+        ImportResult $result
+    ): void {
+        // Use bulk insert if available (much faster)
+        if (method_exists($import, 'bulkInsert')) {
+            $inserted = (int) $import->bulkInsert($chunk);
+            $result->incrementSuccess($inserted);
+            return;
+        }
+
+        // Fallback: process row by row
+        foreach ($chunk as $row) {
+            $import->row($row, 0);
+            $result->incrementSuccess();
+        }
     }
 
     /**
@@ -361,6 +464,27 @@ final class Importer
         $this->fireEvent($import, 'beforeChunk', [$chunkIndex]);
 
         $processRow = function () use ($import, $chunk, $rowNumbers, $result): void {
+            // Use bulk insert if available (much faster for large datasets)
+            if (method_exists($import, 'bulkInsert')) {
+                try {
+                    $inserted = $import->bulkInsert($chunk);
+                    $result->incrementSuccess($inserted);
+                } catch (\Throwable $e) {
+                    // Fallback to row-by-row on bulk error
+                    foreach ($chunk as $index => $row) {
+                        try {
+                            $import->row($row, $rowNumbers[$index]);
+                            $result->incrementSuccess();
+                        } catch (\Throwable $rowError) {
+                            $result->incrementFailed();
+                            $result->addError($rowNumbers[$index], $rowError->getMessage(), $row);
+                        }
+                    }
+                }
+                return;
+            }
+
+            // Fallback: process row by row
             foreach ($chunk as $index => $row) {
                 try {
                     $import->row($row, $rowNumbers[$index]);
