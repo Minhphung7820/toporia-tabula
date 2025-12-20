@@ -9,6 +9,7 @@ use Toporia\Tabula\Contracts\WithEventsInterface;
 use Toporia\Tabula\Contracts\WithMultipleSheetsInterface;
 use Toporia\Tabula\Contracts\WithProgressInterface;
 use Toporia\Tabula\Contracts\WithTitleInterface;
+use Toporia\Tabula\Contracts\WithTotalCountInterface;
 use Toporia\Tabula\Contracts\WriterInterface;
 use Toporia\Tabula\Exceptions\ExportException;
 use Toporia\Tabula\Support\ExportResult;
@@ -148,8 +149,14 @@ final class Exporter
         $rowCount = 0;
         $data = $export->data();
 
-        // Estimate total for progress (if countable)
-        $total = $data instanceof \Countable ? count($data) : 0;
+        // Get total for progress tracking
+        // Priority: WithTotalCountInterface > Countable > 0
+        $total = 0;
+        if ($export instanceof WithTotalCountInterface) {
+            $total = $export->totalCount();
+        } elseif ($data instanceof \Countable) {
+            $total = count($data);
+        }
 
         foreach ($data as $item) {
             // Map item to row

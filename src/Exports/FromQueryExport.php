@@ -7,13 +7,21 @@ namespace Toporia\Tabula\Exports;
 use Toporia\Tabula\Contracts\ExportableInterface;
 use Toporia\Tabula\Contracts\FromQueryInterface;
 use Toporia\Tabula\Contracts\WithColumnFormattingInterface;
+use Toporia\Tabula\Contracts\WithProgressInterface;
 use Toporia\Tabula\Contracts\WithTitleInterface;
+use Toporia\Tabula\Contracts\WithTotalCountInterface;
 
 /**
  * Class FromQueryExport
  *
  * Export class for exporting from a database query.
- * Uses cursor() for memory-efficient streaming.
+ * Uses lazyById() for memory-efficient streaming with buffered queries.
+ *
+ * Why lazyById() instead of cursor():
+ * - cursor() uses MySQL unbuffered queries which don't allow other queries
+ *   on the same connection while iterating (breaks progress callbacks that update DB)
+ * - lazyById() uses buffered chunk queries with indexed WHERE id > lastId
+ * - Both are O(chunkSize) memory, but lazyById() is more compatible
  *
  * @example
  * // Simple usage
@@ -33,7 +41,9 @@ final class FromQueryExport implements
     ExportableInterface,
     FromQueryInterface,
     WithColumnFormattingInterface,
-    WithTitleInterface
+    WithProgressInterface,
+    WithTitleInterface,
+    WithTotalCountInterface
 {
     private mixed $queryBuilder;
 
@@ -53,6 +63,16 @@ final class FromQueryExport implements
     private array $formatters = [];
 
     private string $titleValue = 'Sheet1';
+
+    /**
+     * @var callable|null Progress callback
+     */
+    private $progressCallback = null;
+
+    /**
+     * @var int Total row count for progress tracking
+     */
+    private int $totalRowCount = 0;
 
     public function __construct(mixed $queryBuilder)
     {
@@ -139,6 +159,63 @@ final class FromQueryExport implements
     }
 
     /**
+     * Set total row count for progress tracking.
+     *
+     * @param int $count Total number of rows
+     * @return self
+     */
+    public function withTotalCount(int $count): self
+    {
+        $this->totalRowCount = $count;
+        return $this;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function totalCount(): int
+    {
+        return $this->totalRowCount;
+    }
+
+    /**
+     * Set progress callback.
+     *
+     * @param callable(int, int): void $callback Callback receives (processed, total)
+     * @return self
+     *
+     * @example
+     *     ->withProgressCallback(function (int $processed, int $total) {
+     *         echo "Exported {$processed}/{$total} rows\n";
+     *     })
+     */
+    public function withProgressCallback(callable $callback): self
+    {
+        $this->progressCallback = $callback;
+        return $this;
+    }
+
+    /**
+     * {@inheritdoc}
+     */
+    public function onProgress(int $current, int $total, float $percentage): void
+    {
+        if ($this->progressCallback !== null) {
+            ($this->progressCallback)($current, $total);
+        }
+    }
+
+    /**
+     * Check if progress callback is set.
+     *
+     * @return bool
+     */
+    public function hasProgressCallback(): bool
+    {
+        return $this->progressCallback !== null;
+    }
+
+    /**
      * {@inheritdoc}
      */
     public function query(): mixed
@@ -160,8 +237,23 @@ final class FromQueryExport implements
     {
         $query = $this->query();
 
-        // Use cursor for memory efficiency
-        if (method_exists($query, 'cursor')) {
+        // Use lazyById for memory-efficient streaming with buffered queries.
+        // Why not cursor()? cursor() uses MySQL unbuffered queries which don't allow
+        // other queries on the same connection while iterating. This breaks progress
+        // callbacks that need to update the database (e.g., job progress tracking).
+        // lazyById() uses buffered chunk queries with indexed WHERE id > lastId,
+        // which is both memory-efficient O(chunkSize) and allows DB operations during iteration.
+        if (method_exists($query, 'lazyById')) {
+            foreach ($query->lazyById(1000) as $model) {
+                yield $this->mapModel($model);
+            }
+        } elseif (method_exists($query, 'lazy')) {
+            // Fallback to lazy() if lazyById() not available
+            foreach ($query->lazy(1000) as $model) {
+                yield $this->mapModel($model);
+            }
+        } elseif (method_exists($query, 'cursor')) {
+            // Last resort: cursor() - but progress callbacks with DB updates will fail
             foreach ($query->cursor() as $model) {
                 yield $this->mapModel($model);
             }
