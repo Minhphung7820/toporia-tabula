@@ -10,6 +10,7 @@ use Toporia\Tabula\Contracts\WithBatchInsertsInterface;
 use Toporia\Tabula\Contracts\WithChunkReadingInterface;
 use Toporia\Tabula\Contracts\WithHeadingRowInterface;
 use Toporia\Tabula\Contracts\WithParallelInterface;
+use Toporia\Tabula\Contracts\WithProgressInterface;
 
 /**
  * Class ToModelImport
@@ -52,7 +53,8 @@ final class ToModelImport implements
     WithChunkReadingInterface,
     WithBatchInsertsInterface,
     WithHeadingRowInterface,
-    WithParallelInterface
+    WithParallelInterface,
+    WithProgressInterface
 {
     private string $modelClass;
 
@@ -60,6 +62,11 @@ final class ToModelImport implements
      * @var callable|null Row mapper
      */
     private $mapper = null;
+
+    /**
+     * @var callable|null Progress callback
+     */
+    private $progressCallback = null;
 
     /**
      * @var array<string>|null Unique columns for upsert
@@ -558,5 +565,50 @@ final class ToModelImport implements
     public function __destruct()
     {
         $this->flushBatch();
+    }
+
+    /**
+     * Set progress callback (fluent API).
+     *
+     * The callback receives: (int $current, int $total)
+     * This is called during import to report progress.
+     *
+     * @param callable(int, int): void $callback
+     * @return self
+     *
+     * @example
+     * $import = ToModelImport::make(Post::class)
+     *     ->map(fn($row) => [...])
+     *     ->withProgressCallback(function (int $processed, int $total) {
+     *         echo "Progress: {$processed}/{$total}\n";
+     *     });
+     */
+    public function withProgressCallback(callable $callback): self
+    {
+        $this->progressCallback = $callback;
+        return $this;
+    }
+
+    /**
+     * {@inheritdoc}
+     *
+     * Called by Importer when progress updates.
+     * Delegates to user-defined callback if set.
+     */
+    public function onProgress(int $current, int $total, float $percentage): void
+    {
+        if ($this->progressCallback !== null) {
+            ($this->progressCallback)($current, $total);
+        }
+    }
+
+    /**
+     * Check if progress tracking is enabled.
+     *
+     * @return bool
+     */
+    public function hasProgressCallback(): bool
+    {
+        return $this->progressCallback !== null;
     }
 }

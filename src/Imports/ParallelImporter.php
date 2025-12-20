@@ -7,6 +7,7 @@ namespace Toporia\Tabula\Imports;
 use Toporia\Tabula\Contracts\ImportableInterface;
 use Toporia\Tabula\Contracts\WithChunkReadingInterface;
 use Toporia\Tabula\Contracts\WithParallelInterface;
+use Toporia\Tabula\Contracts\WithProgressInterface;
 use Toporia\Tabula\Exceptions\ImportException;
 use Toporia\Tabula\Support\ImportResult;
 
@@ -48,6 +49,38 @@ final class ParallelImporter
     private array $results = [];
 
     /**
+     * Progress callback for real-time updates.
+     *
+     * @var callable|null
+     */
+    private $progressCallback = null;
+
+    /**
+     * Total rows to import (for progress calculation).
+     */
+    private int $totalRows = 0;
+
+    /**
+     * Model class for counting inserted rows.
+     */
+    private string $modelClass = '';
+
+    /**
+     * Initial row count before import (for progress calculation).
+     */
+    private int $initialRowCount = 0;
+
+    /**
+     * Last time progress was reported (for throttling).
+     */
+    private float $lastProgressTime = 0;
+
+    /**
+     * Last reported progress percentage (for avoiding duplicate updates).
+     */
+    private int $lastProgressPercent = -1;
+
+    /**
      * Set concurrency driver.
      *
      * @param string $driver Driver name (fork, process, sync)
@@ -79,6 +112,72 @@ final class ParallelImporter
     }
 
     /**
+     * Count total data rows in CSV file (excluding header).
+     *
+     * @param string $filePath Path to CSV file
+     * @return int Number of data rows
+     */
+    private function countRows(string $filePath): int
+    {
+        $count = 0;
+        $handle = @fopen($filePath, 'r');
+
+        if ($handle === false) {
+            return 0;
+        }
+
+        // Skip header row
+        @fgetcsv($handle, 0, ',', '"', '');
+
+        // Count data rows
+        while (@fgetcsv($handle, 0, ',', '"', '') !== false) {
+            $count++;
+        }
+
+        fclose($handle);
+
+        return $count;
+    }
+
+    /**
+     * Check and report progress by counting database rows.
+     *
+     * Uses throttling to avoid excessive database queries (max once per 500ms).
+     * Reports progress only when percentage changes by at least 2%.
+     *
+     * @return void
+     */
+    private function checkAndReportProgress(): void
+    {
+        // Skip if no progress callback or model class
+        if ($this->progressCallback === null || $this->modelClass === '' || $this->totalRows === 0) {
+            return;
+        }
+
+        // Throttle progress checks (max once per 500ms)
+        $now = microtime(true);
+        if ($now - $this->lastProgressTime < 0.5) {
+            return;
+        }
+        $this->lastProgressTime = $now;
+
+        // Count current rows in database
+        try {
+            $currentCount = $this->modelClass::count();
+            $insertedRows = $currentCount - $this->initialRowCount;
+            $percentage = (int) (($insertedRows / $this->totalRows) * 100);
+
+            // Only report if progress changed by at least 2%
+            if ($percentage > $this->lastProgressPercent + 1) {
+                $this->lastProgressPercent = $percentage;
+                ($this->progressCallback)(min($insertedRows, $this->totalRows), $this->totalRows);
+            }
+        } catch (\Throwable $e) {
+            // Ignore count errors - progress is optional
+        }
+    }
+
+    /**
      * Import CSV file using parallel workers.
      *
      * @param ImportableInterface&WithChunkReadingInterface&WithParallelInterface $import
@@ -91,6 +190,36 @@ final class ParallelImporter
     ): ImportResult {
         if (!file_exists($filePath)) {
             throw ImportException::fileNotFound($filePath);
+        }
+
+        // Extract progress callback if available
+        if ($import instanceof WithProgressInterface) {
+            // Try to get the progress callback from ToModelImport
+            if (method_exists($import, 'hasProgressCallback') && $import->hasProgressCallback()) {
+                $this->progressCallback = function (int $current, int $total) use ($import): void {
+                    $percentage = $total > 0 ? ($current / $total) * 100 : 0;
+                    $import->onProgress($current, $total, $percentage);
+                };
+            }
+        }
+
+        // Count total rows for progress tracking
+        if ($this->progressCallback !== null) {
+            $this->totalRows = $this->countRows($filePath);
+
+            // Get model class for counting inserted rows
+            if (method_exists($import, 'model')) {
+                $this->modelClass = $import->model();
+                // Store initial row count
+                try {
+                    $this->initialRowCount = $this->modelClass::count();
+                } catch (\Throwable $e) {
+                    $this->initialRowCount = 0;
+                }
+            }
+
+            // Report initial progress
+            ($this->progressCallback)(0, $this->totalRows);
         }
 
         // Auto-select driver if not available
@@ -903,10 +1032,18 @@ WORKER_SCRIPT;
                 // result === 0 means still running
             }
 
+            // Check and report progress while workers are running
+            $this->checkAndReportProgress();
+
             // Small delay to prevent CPU spinning
             if (!empty($this->runningWorkers)) {
                 usleep(5000); // 5ms
             }
+        }
+
+        // Report final progress
+        if ($this->progressCallback !== null && $this->totalRows > 0) {
+            ($this->progressCallback)($this->totalRows, $this->totalRows);
         }
     }
 
@@ -959,10 +1096,18 @@ WORKER_SCRIPT;
             }
             unset($info);
 
+            // Check and report progress while workers are running
+            $this->checkAndReportProgress();
+
             // Small delay
             if (!empty($processes)) {
                 usleep(10000); // 10ms
             }
+        }
+
+        // Report final progress
+        if ($this->progressCallback !== null && $this->totalRows > 0) {
+            ($this->progressCallback)($this->totalRows, $this->totalRows);
         }
     }
 
