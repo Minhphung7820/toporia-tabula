@@ -77,6 +77,7 @@ final class ToModelImport implements
     private int $workersValue = 1;
     private string $driverValue = 'process';
     private bool $disableFkChecks = false;
+    private bool $disableTriggersFlag = false;
 
     /**
      * @var array<array<string, mixed>> Batch buffer for inserts
@@ -225,6 +226,34 @@ final class ToModelImport implements
     }
 
     /**
+     * Disable triggers during import.
+     *
+     * CRITICAL for bulk imports with trigger-maintained statistics.
+     * When importing millions of rows, triggers on each INSERT cause
+     * massive slowdowns (e.g., 2M trigger executions for 1M rows).
+     *
+     * After import, run stats:recalculate to update pre-computed values.
+     *
+     * @param bool $disable
+     * @return self
+     */
+    public function disableTriggers(bool $disable = true): self
+    {
+        $this->disableTriggersFlag = $disable;
+        return $this;
+    }
+
+    /**
+     * Check if triggers should be disabled.
+     *
+     * @return bool
+     */
+    public function shouldDisableTriggers(): bool
+    {
+        return $this->disableTriggersFlag;
+    }
+
+    /**
      * {@inheritdoc}
      */
     public function workers(): int
@@ -331,17 +360,39 @@ final class ToModelImport implements
     {
         $model = $this->modelClass;
         $total = 0;
+        $conn = null;
 
-        // Disable foreign key checks if configured
-        $fkDisabled = false;
-        if ($this->disableFkChecks && function_exists('DB') && function_exists('config')) {
+        // Get database connection
+        if (($this->disableFkChecks || $this->disableTriggersFlag) && function_exists('DB') && function_exists('config')) {
             try {
                 $defaultConnection = config('database.default', 'mysql');
                 $conn = DB()->connection($defaultConnection);
+            } catch (\Throwable $e) {
+                // Continue without connection
+            }
+        }
+
+        // Disable foreign key checks if configured
+        $fkDisabled = false;
+        if ($this->disableFkChecks && $conn !== null) {
+            try {
                 $conn->statement('SET FOREIGN_KEY_CHECKS=0');
                 $fkDisabled = true;
             } catch (\Throwable $e) {
                 // Silently continue if FK disable fails
+            }
+        }
+
+        // Disable triggers if configured (MySQL specific)
+        $triggersDisabled = false;
+        if ($this->disableTriggersFlag && $conn !== null) {
+            try {
+                // MySQL: Temporarily set session variable to skip triggers
+                // Note: This requires SUPER privilege or MySQL 8.0.14+
+                $conn->statement("SET @DISABLE_TRIGGERS = 1");
+                $triggersDisabled = true;
+            } catch (\Throwable $e) {
+                // Triggers can't be disabled, will be slow
             }
         }
 
@@ -363,11 +414,18 @@ final class ToModelImport implements
                 $total += count($chunk);
             }
         } finally {
-            // Re-enable foreign key checks
-            if ($fkDisabled) {
+            // Re-enable triggers
+            if ($triggersDisabled && $conn !== null) {
                 try {
-                    $defaultConnection = config('database.default', 'mysql');
-                    $conn = DB()->connection($defaultConnection);
+                    $conn->statement("SET @DISABLE_TRIGGERS = NULL");
+                } catch (\Throwable $e) {
+                    // Silently continue
+                }
+            }
+
+            // Re-enable foreign key checks
+            if ($fkDisabled && $conn !== null) {
+                try {
                     $conn->statement('SET FOREIGN_KEY_CHECKS=1');
                 } catch (\Throwable $e) {
                     // Silently continue
