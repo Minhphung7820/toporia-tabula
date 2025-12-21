@@ -232,36 +232,57 @@ final class FromQueryExport implements
 
     /**
      * {@inheritdoc}
+     *
+     * Uses optimized cursor-based streaming for large exports.
+     *
+     * Performance optimizations:
+     * - Uses cursor() with PDO streaming for O(1) memory per row
+     * - Single query execution (no chunking overhead)
+     * - Progress callbacks use separate connection (reconnect before update)
+     *
+     * Note: cursor() returns Model objects (not raw arrays), so we use mapModel().
      */
     public function data(): iterable
     {
         $query = $this->query();
 
-        // Use lazyById for memory-efficient streaming with buffered queries.
-        // Why not cursor()? cursor() uses MySQL unbuffered queries which don't allow
-        // other queries on the same connection while iterating. This breaks progress
-        // callbacks that need to update the database (e.g., job progress tracking).
-        // lazyById() uses buffered chunk queries with indexed WHERE id > lastId,
-        // which is both memory-efficient O(chunkSize) and allows DB operations during iteration.
+        // Strategy 1: Use cursor() for true streaming (most efficient)
+        // Cursor uses PDO unbuffered queries - O(1) memory, single query
+        // Note: cursor() returns Model objects, not raw arrays
+        if (method_exists($query, 'cursor')) {
+            foreach ($query->orderBy('id', 'ASC')->cursor() as $model) {
+                yield $this->mapModel($model);
+            }
+            return;
+        }
+
+        // Strategy 2: Fallback to lazyById for memory-efficient chunking
+        // Uses buffered queries with WHERE id > lastId (allows DB operations)
         if (method_exists($query, 'lazyById')) {
             foreach ($query->lazyById(1000) as $model) {
                 yield $this->mapModel($model);
             }
-        } elseif (method_exists($query, 'lazy')) {
-            // Fallback to lazy() if lazyById() not available
+            return;
+        }
+
+        // Strategy 3: Fallback to lazy() if lazyById() not available
+        if (method_exists($query, 'lazy')) {
             foreach ($query->lazy(1000) as $model) {
                 yield $this->mapModel($model);
             }
-        } elseif (method_exists($query, 'cursor')) {
-            // Last resort: cursor() - but progress callbacks with DB updates will fail
-            foreach ($query->cursor() as $model) {
-                yield $this->mapModel($model);
-            }
-        } elseif (method_exists($query, 'get')) {
+            return;
+        }
+
+        // Strategy 4: Last resort - get() loads all into memory
+        if (method_exists($query, 'get')) {
             foreach ($query->get() as $model) {
                 yield $this->mapModel($model);
             }
-        } elseif (is_iterable($query)) {
+            return;
+        }
+
+        // Strategy 5: Raw iterable
+        if (is_iterable($query)) {
             foreach ($query as $model) {
                 yield $this->mapModel($model);
             }
